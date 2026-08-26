@@ -351,7 +351,7 @@ def parse_args():
     parser.add_argument("--input_mode", choices=["h5", "csv"], required=True)
     parser.add_argument("--split_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--data_dir", type=Path, default=Path("../../../../data2/jacksparo/batch4/"))
+    parser.add_argument("--data_dir", type=Path, default=None)
     parser.add_argument("--h5", default=DEFAULT_H5)
     parser.add_argument("--h5_index", default=DEFAULT_H5_INDEX)
     parser.add_argument("--corrections", default=DEFAULT_CORRECTIONS)
