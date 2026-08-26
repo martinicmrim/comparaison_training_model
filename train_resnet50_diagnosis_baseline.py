@@ -567,7 +567,7 @@ def save_predictions(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=Path, default=Path("../../../../data2/jacksparo/batch4/"))
+    parser.add_argument("--data_dir", type=Path, default=None)
     parser.add_argument("--annotations", default="annotations_modified.csv")
     parser.add_argument("--logs", default="logs.csv")
     parser.add_argument("--h5", default=DEFAULT_H5)
