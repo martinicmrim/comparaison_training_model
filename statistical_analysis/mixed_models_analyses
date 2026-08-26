@@ -1,0 +1,485 @@
+
+# analyse_experiments.R
+# Expected columns:
+# participant_id, y_true, y_pred, fold, budget, strategy
+# Optional: task, dataset, seed
+#
+# Outputs:
+# - Macro-F1 and QWK by dataset / method / budget / fold
+# - Mean, SD and 95% CI across folds
+# - Paired patient-level bootstrap deltas versus DINOv2
+# - Optional mixed-effects analyses on correctness and ordinal error
+#
+# Required packages:
+# install.packages(c("tidyverse", "lme4", "emmeans", "broom.mixed"))
+
+library(tidyverse)
+library(lme4)
+library(emmeans)
+library(broom.mixed)
+
+# -------------------------------------------------------------------------
+# 1. CONFIGURATION
+# -------------------------------------------------------------------------
+
+prediction_files <- tribble(
+  ~path, ~dataset, ~method,
+  # Replace these example paths with your actual files:
+  "outputs_dino_diagnosis/predictions_all_folds.csv",
+  "periodontal_diagnosis",
+  "DINOv2",
+
+  "outputs_mae100k_diagnosis/predictions_all_folds.csv",
+  "periodontal_diagnosis",
+  "MAE-SSL-100k",
+
+  "outputs_resnet50_imagenet_diagnosis/predictions_all_folds.csv",
+  "periodontal_diagnosis",
+  "ResNet50-ImageNet",
+
+  "outputs_resnet50_scratch_diagnosis/predictions_all_folds.csv",
+  "periodontal_diagnosis",
+  "ResNet50-Scratch"
+
+  # Example external MGI rows:
+  # "outputs_dino_mgi/predictions_all_folds.csv",
+  # "external_mgi",
+  # "DINOv2"
+)
+
+reference_method <- "DINOv2"
+bootstrap_repetitions <- 2000
+bootstrap_seed <- 2026
+
+output_dir <- "analysis_results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------------------------------------------------------
+# 2. METRICS
+# -------------------------------------------------------------------------
+
+macro_f1 <- function(y_true, y_pred) {
+  classes <- sort(unique(c(y_true, y_pred)))
+
+  f1_values <- map_dbl(classes, function(cls) {
+    tp <- sum(y_true == cls & y_pred == cls)
+    fp <- sum(y_true != cls & y_pred == cls)
+    fn <- sum(y_true == cls & y_pred != cls)
+
+    precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+    recall <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+
+    if (precision + recall == 0) {
+      0
+    } else {
+      2 * precision * recall / (precision + recall)
+    }
+  })
+
+  mean(f1_values)
+}
+
+quadratic_weighted_kappa <- function(y_true, y_pred) {
+  labels <- sort(unique(c(y_true, y_pred)))
+  k <- length(labels)
+
+  if (k < 2) {
+    return(NA_real_)
+  }
+
+  true_idx <- match(y_true, labels)
+  pred_idx <- match(y_pred, labels)
+
+  observed <- table(
+    factor(true_idx, levels = seq_len(k)),
+    factor(pred_idx, levels = seq_len(k))
+  )
+  observed <- observed / sum(observed)
+
+  true_hist <- rowSums(observed)
+  pred_hist <- colSums(observed)
+  expected <- outer(true_hist, pred_hist)
+
+  weights <- outer(
+    seq_len(k),
+    seq_len(k),
+    function(i, j) ((i - j)^2) / ((k - 1)^2)
+  )
+
+  observed_disagreement <- sum(weights * observed)
+  expected_disagreement <- sum(weights * expected)
+
+  if (expected_disagreement == 0) {
+    return(NA_real_)
+  }
+
+  1 - observed_disagreement / expected_disagreement
+}
+
+metric_vector <- function(data) {
+  tibble(
+    n = nrow(data),
+    macro_f1 = macro_f1(data$y_true, data$y_pred),
+    qwk = quadratic_weighted_kappa(data$y_true, data$y_pred),
+    accuracy = mean(data$y_true == data$y_pred),
+    ordinal_mae = mean(abs(data$y_true - data$y_pred))
+  )
+}
+
+# -------------------------------------------------------------------------
+# 3. LOAD AND STANDARDIZE
+# -------------------------------------------------------------------------
+
+read_prediction_file <- function(path, dataset, method) {
+  if (!file.exists(path)) {
+    warning("Missing file: ", path)
+    return(NULL)
+  }
+
+  x <- read_csv(path, show_col_types = FALSE)
+
+  required <- c("participant_id", "y_true", "y_pred")
+  missing_columns <- setdiff(required, names(x))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "File ", path, " is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  if (!"fold" %in% names(x)) {
+    x$fold <- 1L
+  }
+
+  if (!"budget" %in% names(x)) {
+    x$budget <- "full"
+  }
+
+  x %>%
+    mutate(
+      dataset = dataset,
+      method = method,
+      participant_id = as.character(participant_id),
+      fold = as.character(fold),
+      budget = as.character(budget),
+      y_true = as.integer(y_true),
+      y_pred = as.integer(y_pred),
+      correct = as.integer(y_true == y_pred),
+      ordinal_abs_error = abs(y_true - y_pred)
+    )
+}
+
+predictions <- pmap_dfr(
+  prediction_files,
+  read_prediction_file
+)
+
+if (nrow(predictions) == 0) {
+  stop("No prediction files could be loaded.")
+}
+
+write_csv(predictions, file.path(output_dir, "predictions_combined.csv"))
+
+# -------------------------------------------------------------------------
+# 4. METRICS BY FOLD
+# -------------------------------------------------------------------------
+
+metrics_by_fold <- predictions %>%
+  group_by(dataset, method, budget, fold) %>%
+  group_modify(~ metric_vector(.x)) %>%
+  ungroup()
+
+write_csv(metrics_by_fold, file.path(output_dir, "metrics_by_fold.csv"))
+
+metrics_summary <- metrics_by_fold %>%
+  group_by(dataset, method, budget) %>%
+  summarise(
+    n_folds = n(),
+    macro_f1_mean = mean(macro_f1, na.rm = TRUE),
+    macro_f1_sd = sd(macro_f1, na.rm = TRUE),
+    macro_f1_se = macro_f1_sd / sqrt(n_folds),
+    macro_f1_ci_low = macro_f1_mean - qt(0.975, pmax(n_folds - 1, 1)) * macro_f1_se,
+    macro_f1_ci_high = macro_f1_mean + qt(0.975, pmax(n_folds - 1, 1)) * macro_f1_se,
+    qwk_mean = mean(qwk, na.rm = TRUE),
+    qwk_sd = sd(qwk, na.rm = TRUE),
+    qwk_se = qwk_sd / sqrt(n_folds),
+    qwk_ci_low = qwk_mean - qt(0.975, pmax(n_folds - 1, 1)) * qwk_se,
+    qwk_ci_high = qwk_mean + qt(0.975, pmax(n_folds - 1, 1)) * qwk_se,
+    .groups = "drop"
+  )
+
+write_csv(metrics_summary, file.path(output_dir, "metrics_summary.csv"))
+
+# -------------------------------------------------------------------------
+# 5. LEARNING CURVES
+# -------------------------------------------------------------------------
+
+budget_to_numeric <- function(x) {
+  case_when(
+    x == "full" ~ Inf,
+    TRUE ~ suppressWarnings(as.numeric(x))
+  )
+}
+
+plot_data <- metrics_summary %>%
+  mutate(budget_numeric = budget_to_numeric(budget))
+
+p_f1 <- ggplot(
+  plot_data,
+  aes(
+    x = budget_numeric,
+    y = macro_f1_mean,
+    group = method,
+    linetype = method,
+    shape = method
+  )
+) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = macro_f1_ci_low,
+      ymax = macro_f1_ci_high
+    ),
+    width = 0
+  ) +
+  facet_wrap(~ dataset, scales = "free_x") +
+  labs(
+    x = "Annotation budget",
+    y = "Macro-F1",
+    linetype = "Method",
+    shape = "Method"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave(
+  file.path(output_dir, "learning_curve_macro_f1.pdf"),
+  p_f1,
+  width = 7,
+  height = 4.5
+)
+
+p_qwk <- ggplot(
+  plot_data,
+  aes(
+    x = budget_numeric,
+    y = qwk_mean,
+    group = method,
+    linetype = method,
+    shape = method
+  )
+) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = qwk_ci_low,
+      ymax = qwk_ci_high
+    ),
+    width = 0
+  ) +
+  facet_wrap(~ dataset, scales = "free_x") +
+  labs(
+    x = "Annotation budget",
+    y = "Quadratic weighted kappa",
+    linetype = "Method",
+    shape = "Method"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave(
+  file.path(output_dir, "learning_curve_qwk.pdf"),
+  p_qwk,
+  width = 7,
+  height = 4.5
+)
+
+# -------------------------------------------------------------------------
+# 6. PAIRED PATIENT-LEVEL BOOTSTRAP
+# -------------------------------------------------------------------------
+
+paired_bootstrap_delta <- function(
+  data,
+  method_a,
+  method_b,
+  metric = c("macro_f1", "qwk"),
+  repetitions = 2000,
+  seed = 2026
+) {
+  metric <- match.arg(metric)
+
+  wide <- data %>%
+    filter(method %in% c(method_a, method_b)) %>%
+    select(
+      dataset,
+      budget,
+      fold,
+      participant_id,
+      method,
+      y_true,
+      y_pred
+    ) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = method,
+      values_from = y_pred
+    ) %>%
+    drop_na(all_of(c(method_a, method_b)))
+
+  if (nrow(wide) == 0) {
+    return(tibble())
+  }
+
+  set.seed(seed)
+
+  deltas <- replicate(repetitions, {
+    sampled_rows <- sample.int(
+      nrow(wide),
+      size = nrow(wide),
+      replace = TRUE
+    )
+
+    boot <- wide[sampled_rows, ]
+
+    if (metric == "macro_f1") {
+      value_a <- macro_f1(boot$y_true, boot[[method_a]])
+      value_b <- macro_f1(boot$y_true, boot[[method_b]])
+    } else {
+      value_a <- quadratic_weighted_kappa(boot$y_true, boot[[method_a]])
+      value_b <- quadratic_weighted_kappa(boot$y_true, boot[[method_b]])
+    }
+
+    value_b - value_a
+  })
+
+  tibble(
+    reference = method_a,
+    comparison = method_b,
+    metric = metric,
+    delta_mean = mean(deltas, na.rm = TRUE),
+    ci_low = quantile(deltas, 0.025, na.rm = TRUE),
+    ci_high = quantile(deltas, 0.975, na.rm = TRUE),
+    p_two_sided = 2 * min(
+      mean(deltas <= 0, na.rm = TRUE),
+      mean(deltas >= 0, na.rm = TRUE)
+    )
+  )
+}
+
+comparison_methods <- setdiff(unique(predictions$method), reference_method)
+
+bootstrap_results <- crossing(
+  dataset = unique(predictions$dataset),
+  budget = unique(predictions$budget),
+  comparison = comparison_methods,
+  metric = c("macro_f1", "qwk")
+) %>%
+  pmap_dfr(function(dataset, budget, comparison, metric) {
+    subset_data <- predictions %>%
+      filter(
+        .data$dataset == dataset,
+        .data$budget == budget
+      )
+
+    result <- paired_bootstrap_delta(
+      subset_data,
+      method_a = reference_method,
+      method_b = comparison,
+      metric = metric,
+      repetitions = bootstrap_repetitions,
+      seed = bootstrap_seed
+    )
+
+    if (nrow(result) == 0) {
+      return(tibble())
+    }
+
+    result %>%
+      mutate(
+        dataset = dataset,
+        budget = budget
+      )
+  })
+
+write_csv(
+  bootstrap_results,
+  file.path(output_dir, "paired_bootstrap_vs_reference.csv")
+)
+
+# -------------------------------------------------------------------------
+# 7. OPTIONAL MIXED-EFFECTS MODELS
+# -------------------------------------------------------------------------
+
+model_data <- predictions %>%
+  mutate(
+    method = factor(method),
+    dataset = factor(dataset),
+    budget = factor(budget),
+    fold = factor(fold),
+    participant_id = factor(participant_id)
+  )
+
+if (n_distinct(model_data$method) >= 2) {
+  correctness_model <- glmer(
+    correct ~ method * budget + dataset +
+      (1 | participant_id) +
+      (1 | fold),
+    data = model_data,
+    family = binomial,
+    control = glmerControl(
+      optimizer = "bobyqa",
+      optCtrl = list(maxfun = 2e5)
+    )
+  )
+
+  saveRDS(
+    correctness_model,
+    file.path(output_dir, "mixed_model_correctness.rds")
+  )
+
+  write_csv(
+    tidy(
+      correctness_model,
+      effects = "fixed",
+      conf.int = TRUE,
+      exponentiate = TRUE
+    ),
+    file.path(output_dir, "mixed_model_correctness_fixed_effects.csv")
+  )
+
+  correctness_emmeans <- emmeans(
+    correctness_model,
+    pairwise ~ method | dataset + budget,
+    type = "response",
+    adjust = "tukey"
+  )
+
+  write_csv(
+    as.data.frame(correctness_emmeans$contrasts),
+    file.path(output_dir, "mixed_model_correctness_pairwise.csv")
+  )
+
+  ordinal_error_model <- lmer(
+    ordinal_abs_error ~ method * budget + dataset +
+      (1 | participant_id) +
+      (1 | fold),
+    data = model_data
+  )
+
+  saveRDS(
+    ordinal_error_model,
+    file.path(output_dir, "mixed_model_ordinal_error.rds")
+  )
+
+  write_csv(
+    tidy(
+      ordinal_error_model,
+      effects = "fixed",
+      conf.int = TRUE
+    ),
+    file.path(output_dir, "mixed_model_ordinal_error_fixed_effects.csv")
+  )
+}
+
+message("Analysis complete. Results saved in: ", output_dir)
